@@ -1,5 +1,4 @@
 import os
-import re
 from datetime import date, timedelta
 
 from flask import Flask, jsonify, request
@@ -7,28 +6,10 @@ from flask import Flask, jsonify, request
 from db import DB_PATH, connect, init_db
 from fines import days_late, fine_for_days, money
 from mailer import send
+from rules import balance, loan_limit
+from validation import check
 
 app = Flask(__name__)
-
-
-# ---------- helpers ----------
-
-
-def check(value, kind):
-    if kind == "email":
-        return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(value)) is not None
-    elif kind == "isbn":
-        digits = str(value).replace("-", "")
-        return digits.isdigit() and len(digits) in (10, 13)
-    elif kind == "date":
-        try:
-            date.fromisoformat(str(value))
-            return True
-        except ValueError:
-            return False
-    elif kind == "member_type":
-        return value in ("student", "staff")
-    return False
 
 
 # ---------- books ----------
@@ -150,17 +131,9 @@ def member_loans(member_id):
         return jsonify({"error": "member not found"}), 404
     rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (member_id,)).fetchall()
     conn.close()
-    owed = 0
-    open_loans = 0
+    owed, open_loans = balance(rows)
     loans = []
     for loan in rows:
-        if loan[4] == 0:
-            open_loans += 1
-            days = days_late(loan[3])
-            if days > 0:
-                owed += fine_for_days(days)
-        elif loan[6] == 0:
-            owed += loan[5]
         loans.append(
             {
                 "id": loan[0],
@@ -171,10 +144,7 @@ def member_loans(member_id):
                 "fine_paid": bool(loan[6]),
             }
         )
-    if m[3] == "staff":
-        remaining = 5 - open_loans
-    else:
-        remaining = 3 - open_loans
+    remaining = loan_limit(m[3]) - open_loans
     return jsonify({"loans": loans, "total_owed": money(owed), "loans_remaining": remaining})
 
 
@@ -259,23 +229,11 @@ def create_loan():
         return jsonify({"error": "book is not available"}), 409
 
     rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (data["member_id"],)).fetchall()
-    owed = 0
-    open_loans = 0
-    for loan in rows:
-        if loan[4] == 0:
-            open_loans += 1
-            days = days_late(loan[3])
-            if days > 0:
-                owed += fine_for_days(days)
-        elif loan[6] == 0:
-            owed += loan[5]
+    owed, open_loans = balance(rows)
     if owed > 0:
         conn.close()
         return jsonify({"error": "member has unpaid fines"}), 409
-    limit = 3
-    if member[3] == "staff":
-        limit = 5
-    if open_loans >= limit:
+    if open_loans >= loan_limit(member[3]):
         conn.close()
         return jsonify({"error": "loan limit reached"}), 409
 
@@ -461,14 +419,7 @@ def report_summary():
     total_books = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
     rows = conn.execute("SELECT * FROM loans").fetchall()
     conn.close()
-    on_loan = 0
-    outstanding = 0
-    for loan in rows:
-        if loan[4] == 0:
-            on_loan += 1
-            outstanding += fine_for_days(days_late(loan[3]))
-        elif loan[6] == 0:
-            outstanding += loan[5]
+    outstanding, on_loan = balance(rows)
     return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": money(outstanding)})
 
 
